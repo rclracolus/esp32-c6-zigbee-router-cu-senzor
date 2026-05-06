@@ -5,10 +5,13 @@
 #include "freertos/task.h"
 #include "freertos/timers.h"
 #include "driver/gpio.h"
-#include "driver/adc.h"
-#include "esp_adc_cal.h"
-#include "esp_zigbee_core.h"
-#include "ha/esp_zigbee_ha_standard.h"
+#include "esp_adc/adc_oneshot.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_zigbee.h"
+#include "ezbee/zcl/cluster/basic_desc.h"
+#include "ezbee/zcl/cluster/analog_input_desc.h"
+#include "ezbee/zcl/cluster/binary_input_desc.h"
 
 static const char *TAG = "ZB_ROUTER_MQ7";
 
@@ -24,7 +27,6 @@ static const char *TAG = "ZB_ROUTER_MQ7";
 /* MQ-7 Configuration */
 #define MQ7_SAMPLE_PERIOD_MS        2000        // Citește la fiecare 2 secunde
 #define MQ7_ALARM_THRESHOLD         800         // Prag de alarmă CO (în ppm simulat)
-#define DEFAULT_VREF                1100        // Referință ADC în mV
 
 /* Zigbee Endpoint */
 #define HA_ESP_SENSOR_ENDPOINT      10
@@ -33,32 +35,12 @@ static const char *TAG = "ZB_ROUTER_MQ7";
 #define BUTTON_DEBOUNCE_MS          50
 #define BUTTON_LONG_PRESS_MS        3000
 
-static esp_adc_cal_characteristics_t *adc_chars;
+static adc_oneshot_unit_handle_t adc_handle;
+static adc_cali_handle_t adc_cali_handle;
 static TimerHandle_t button_timer;
 static bool button_pressed = false;
 static uint32_t button_press_time = 0;
 
-/* Zigbee configuration */
-#define ESP_ZB_ZR_CONFIG()                                              \
-    {                                                                   \
-        .esp_zb_role = ESP_ZB_DEVICE_TYPE_ROUTER,                      \
-        .install_code_policy = INSTALLCODE_POLICY_ENABLE,              \
-        .nwk_cfg = {                                                   \
-            .zczr_cfg = {                                              \
-                .max_children = MAX_CHILDREN,                          \
-            },                                                         \
-        },                                                             \
-    }
-
-#define ESP_ZB_DEFAULT_RADIO_CONFIG()                           \
-    {                                                           \
-        .radio_mode = RADIO_MODE_NATIVE,                       \
-    }
-
-#define ESP_ZB_DEFAULT_HOST_CONFIG()                            \
-    {                                                           \
-        .host_connection_mode = HOST_CONNECTION_MODE_NONE,     \
-    }
 
 /* Structure pentru datele senzorului */
 typedef struct {
@@ -101,31 +83,47 @@ static void led_blink(int times, int delay_ms)
 /* ADC/MQ-7 Initialization */
 static void mq7_adc_init(void)
 {
-    // Configure ADC
-    adc1_config_width(ADC_WIDTH_BIT_12);
-    adc1_config_channel_atten(MQ7_ANALOG_GPIO, ADC_ATTEN_DB_11);
-    
-    // Characterize ADC
-    adc_chars = calloc(1, sizeof(esp_adc_cal_characteristics_t));
-    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_11, ADC_WIDTH_BIT_12, 
-                             DEFAULT_VREF, adc_chars);
-    
+    // Configure ADC oneshot unit
+    adc_oneshot_unit_init_cfg_t unit_cfg = {
+        .unit_id = ADC_UNIT_1,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc_handle));
+
+    // Configure channel
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, MQ7_ANALOG_GPIO, &chan_cfg));
+
+    // Initialize calibration
+    adc_cali_curve_fitting_config_t cali_cfg = {
+        .unit_id  = ADC_UNIT_1,
+        .chan     = MQ7_ANALOG_GPIO,
+        .atten    = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    ESP_ERROR_CHECK(adc_cali_create_scheme_curve_fitting(&cali_cfg, &adc_cali_handle));
+
     ESP_LOGI(TAG, "MQ-7 ADC initialized on GPIO0 (ADC1_CH0)");
 }
 
 /* Read MQ-7 sensor */
 static void mq7_read_sensor(void)
 {
-    uint32_t adc_reading = 0;
-    
+    int adc_reading = 0;
+    int sample;
+
     // Multisampling pentru acuratețe
     for (int i = 0; i < 32; i++) {
-        adc_reading += adc1_get_raw(MQ7_ANALOG_GPIO);
+        ESP_ERROR_CHECK(adc_oneshot_read(adc_handle, MQ7_ANALOG_GPIO, &sample));
+        adc_reading += sample;
     }
     adc_reading /= 32;
-    
+
     // Convert to voltage
-    uint32_t voltage = esp_adc_cal_raw_to_voltage(adc_reading, adc_chars);
+    int voltage = 0;
+    ESP_ERROR_CHECK(adc_cali_raw_to_voltage(adc_cali_handle, adc_reading, &voltage));
     
     // Simulare conversie la ppm CO (formula simplificată)
     // Într-o implementare reală, ai nevoie de curba de calibrare MQ-7
@@ -137,7 +135,7 @@ static void mq7_read_sensor(void)
     mq7_data.co_level = co_ppm;
     mq7_data.alarm_status = (co_ppm > MQ7_ALARM_THRESHOLD);
     
-    ESP_LOGI(TAG, "MQ-7: ADC=%lu, Voltage=%lumV, CO=%uppm, Alarm=%s",
+    ESP_LOGI(TAG, "MQ-7: ADC=%d, Voltage=%dmV, CO=%uppm, Alarm=%s",
              adc_reading, voltage, co_ppm, 
              mq7_data.alarm_status ? "YES" : "NO");
     
@@ -186,7 +184,7 @@ static void button_timer_callback(TimerHandle_t xTimer)
             led_blink(5, 200);
             
             // Permite pairing pentru 180 secunde
-            esp_zb_bdb_open_network(180);
+            ezb_bdb_open_network(180);
             ESP_LOGI(TAG, "Network opened for 180 seconds for new devices to join");
         } else {
             // Short press - doar info
@@ -225,20 +223,22 @@ static void button_init(void)
 static void update_zigbee_attributes(void)
 {
     /* Update CO level attribute */
-    esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-                                  ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                  ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-                                  &mq7_data.co_level,
-                                  false);
-    
+    ezb_zcl_set_attr_value(HA_ESP_SENSOR_ENDPOINT,
+                           EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                           EZB_ZCL_CLUSTER_SERVER,
+                           EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+                           EZB_ZCL_STD_MANUF_CODE,
+                           &mq7_data.co_level,
+                           false);
+
     /* Update alarm status */
-    esp_zb_zcl_set_attribute_val(HA_ESP_SENSOR_ENDPOINT,
-                                  ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
-                                  ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                                  ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
-                                  &mq7_data.alarm_status,
-                                  false);
+    ezb_zcl_set_attr_value(HA_ESP_SENSOR_ENDPOINT,
+                           EZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                           EZB_ZCL_CLUSTER_SERVER,
+                           EZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID,
+                           EZB_ZCL_STD_MANUF_CODE,
+                           &mq7_data.alarm_status,
+                           false);
 }
 
 /* MQ-7 monitoring task */
@@ -259,152 +259,171 @@ static void mq7_monitor_task(void *pvParameters)
 }
 
 /* Zigbee signal handler */
-static void bdb_start_top_level_commissioning_cb(uint8_t mode_mask)
+static void bdb_start_top_level_commissioning_cb(void *ctx)
 {
-    ESP_ERROR_CHECK(esp_zb_bdb_start_top_level_commissioning(mode_mask));
+    uint8_t mode_mask = (uint8_t)(uintptr_t)ctx;
+    ezb_bdb_start_top_level_commissioning(mode_mask);
 }
 
-void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct)
+bool esp_zb_app_signal_handler(const ezb_app_signal_t *signal)
 {
-    uint32_t *p_sg_p = signal_struct->p_app_signal;
-    esp_err_t err_status = signal_struct->esp_err_status;
-    esp_zb_app_signal_type_t sig_type = *p_sg_p;
-    
+    ezb_app_signal_type_t sig_type = ezb_app_signal_get_type(signal);
+    const ezb_bdb_signal_simple_params_t *params = (const ezb_bdb_signal_simple_params_t *)ezb_app_signal_get_params(signal);
+    esp_err_t err_status = (params) ? esp_zigbee_err_to_esp(params->status) : ESP_OK;
+
     switch (sig_type) {
-    case ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP:
+    case EZB_ZDO_SIGNAL_SKIP_STARTUP:
         ESP_LOGI(TAG, "Zigbee stack initialized");
-        esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_INITIALIZATION);
+        ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
         break;
-        
-    case ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START:
-    case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
+
+    case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
+    case EZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Device started up in %s factory-reset mode", 
-                     sig_type == ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START ? "" : "non");
+            ESP_LOGI(TAG, "Device started up in %s factory-reset mode",
+                     sig_type == EZB_BDB_SIGNAL_DEVICE_FIRST_START ? "" : "non");
             ESP_LOGI(TAG, "Start network steering");
-            esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
+            ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
             led_blink(3, 300);
         } else {
-            ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)", 
+            ESP_LOGW(TAG, "Failed to initialize Zigbee stack (status: %s)",
                      esp_err_to_name(err_status));
             led_blink(10, 100);
         }
         break;
-        
-    case ESP_ZB_BDB_SIGNAL_STEERING:
+
+    case EZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
-            esp_zb_ieee_addr_t extended_pan_id;
-            esp_zb_get_extended_pan_id(extended_pan_id);
-            ESP_LOGI(TAG, "✓ Joined network successfully");
+            ezb_extpanid_t extended_pan_id;
+            ezb_nwk_get_extended_panid(&extended_pan_id);
+            ESP_LOGI(TAG, "Joined network successfully");
             ESP_LOGI(TAG, "  Extended PAN ID: %02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
-                     extended_pan_id[7], extended_pan_id[6], extended_pan_id[5], extended_pan_id[4],
-                     extended_pan_id[3], extended_pan_id[2], extended_pan_id[1], extended_pan_id[0]);
-            ESP_LOGI(TAG, "  PAN ID: 0x%04hx", esp_zb_get_pan_id());
-            ESP_LOGI(TAG, "  Channel: %d", esp_zb_get_current_channel());
-            ESP_LOGI(TAG, "  Short Address: 0x%04hx", esp_zb_get_short_address());
+                     extended_pan_id.u8[7], extended_pan_id.u8[6], extended_pan_id.u8[5], extended_pan_id.u8[4],
+                     extended_pan_id.u8[3], extended_pan_id.u8[2], extended_pan_id.u8[1], extended_pan_id.u8[0]);
+            ESP_LOGI(TAG, "  PAN ID: 0x%04hx", ezb_nwk_get_panid());
+            ESP_LOGI(TAG, "  Channel: %d", ezb_nwk_get_current_channel());
+            ESP_LOGI(TAG, "  Short Address: 0x%04hx", ezb_nwk_get_short_address());
             led_set(true);
             vTaskDelay(pdMS_TO_TICKS(1000));
             led_set(false);
         } else {
             ESP_LOGI(TAG, "Network steering failed (status: %s)", esp_err_to_name(err_status));
             ESP_LOGI(TAG, "Retrying in 1 second...");
-            esp_zb_scheduler_alarm((esp_zb_callback_t)bdb_start_top_level_commissioning_cb, 
-                                   ESP_ZB_BDB_MODE_NETWORK_STEERING, 1000);
+            esp_zigbee_task_queue_post(bdb_start_top_level_commissioning_cb,
+                                      (void *)(uintptr_t)EZB_BDB_MODE_NETWORK_STEERING);
         }
         break;
-        
-    case ESP_ZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
-        if (err_status == ESP_OK) {
-            ESP_LOGI(TAG, "Network permit join status changed");
-        }
+
+    case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS:
+        ESP_LOGI(TAG, "Network permit join status changed");
         break;
-        
+
     default:
-        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s", 
-                 esp_zb_zdo_signal_to_string(sig_type), sig_type,
+        ESP_LOGI(TAG, "ZDO signal: %s (0x%x), status: %s",
+                 ezb_app_signal_to_string(sig_type), sig_type,
                  esp_err_to_name(err_status));
         break;
     }
+    return true;
 }
 
-/* Create custom sensor endpoint */
-static void esp_zb_create_sensor_ep(esp_zb_ep_list_t *ep_list)
+/* Create custom sensor endpoint and return device descriptor */
+static ezb_af_device_desc_t esp_zb_create_sensor_device(void)
 {
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-    
-    /* Basic cluster */
-    esp_zb_attribute_list_t *basic_cluster = esp_zb_basic_cluster_create(NULL);
-    uint8_t manufacturer_name[] = {9, 'E', 's', 'p', 'r', 'e', 's', 's', 'i', 'f'};
-    uint8_t model_id[] = {13, 'M', 'Q', '-', '7', '.', 'R', 'o', 'u', 't', 'e', 'r', '.', '1'};
-    esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manufacturer_name);
-    esp_zb_basic_cluster_add_attr(basic_cluster, ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);
-    esp_zb_cluster_list_add_basic_cluster(cluster_list, basic_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    
-    /* Analog Input cluster for CO level */
-    esp_zb_attribute_list_t *analog_input_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT);
-    float initial_value = 0.0f;
-    esp_zb_analog_input_cluster_add_attr(analog_input_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &initial_value);
-    uint8_t description[] = {8, 'C', 'O', ' ', 'L', 'e', 'v', 'e', 'l'};
-    esp_zb_analog_input_cluster_add_attr(analog_input_cluster, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, description);
-    esp_zb_cluster_list_add_analog_input_cluster(cluster_list, analog_input_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    
-    /* Binary Input cluster for alarm status */
-    esp_zb_attribute_list_t *binary_input_cluster = esp_zb_zcl_attr_list_create(ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT);
-    bool alarm_initial = false;
-    esp_zb_binary_input_cluster_add_attr(binary_input_cluster, ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &alarm_initial);
-    esp_zb_cluster_list_add_binary_input_cluster(cluster_list, binary_input_cluster, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
-    
-    /* Create endpoint */
-    esp_zb_endpoint_config_t endpoint_config = {
-        .endpoint = HA_ESP_SENSOR_ENDPOINT,
-        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id = ESP_ZB_HA_CUSTOM_ATTR_DEVICE_ID,
-        .app_device_version = 0
+    /* --- Basic cluster server --- */
+    ezb_zcl_basic_cluster_server_config_t basic_cfg = {
+        .zcl_version  = EZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = EZB_ZCL_BASIC_POWER_SOURCE_SINGLE_PHASE_MAINS,
     };
-    esp_zb_ep_list_add_ep(ep_list, cluster_list, endpoint_config);
+    ezb_zcl_cluster_desc_t basic_desc = ezb_zcl_basic_create_cluster_desc(&basic_cfg, EZB_ZCL_CLUSTER_SERVER);
+    uint8_t manufacturer_name[] = {9, 'E', 's', 'p', 'r', 'e', 's', 's', 'i', 'f'};
+    uint8_t model_id[]          = {13, 'M', 'Q', '-', '7', '.', 'R', 'o', 'u', 't', 'e', 'r', '.', '1'};
+    ezb_zcl_basic_cluster_desc_add_attr(basic_desc, EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manufacturer_name);
+    ezb_zcl_basic_cluster_desc_add_attr(basic_desc, EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_id);
+
+    /* --- Analog Input cluster server - CO level (ppm) --- */
+    ezb_zcl_analog_input_cluster_server_config_t analog_cfg = {
+        .out_of_service = false,
+        .present_value  = 0.0f,
+        .status_flags   = EZB_ZCL_ANALOG_INPUT_STATUS_FLAGS_DEFAULT_VALUE,
+    };
+    ezb_zcl_cluster_desc_t analog_desc = ezb_zcl_analog_input_create_cluster_desc(&analog_cfg, EZB_ZCL_CLUSTER_SERVER);
+    uint8_t co_description[] = {8, 'C', 'O', ' ', 'L', 'e', 'v', 'e', 'l'};
+    ezb_zcl_analog_input_cluster_desc_add_attr(analog_desc, EZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, co_description);
+
+    /* --- Binary Input cluster server - alarm status --- */
+    ezb_zcl_binary_input_cluster_server_config_t binary_cfg = {
+        .out_of_service = false,
+        .present_value  = false,
+        .status_flags   = EZB_ZCL_BINARY_INPUT_STATUS_FLAGS_DEFAULT_VALUE,
+    };
+    ezb_zcl_cluster_desc_t binary_desc = ezb_zcl_binary_input_create_cluster_desc(&binary_cfg, EZB_ZCL_CLUSTER_SERVER);
+    uint8_t alarm_description[] = {5, 'A', 'l', 'a', 'r', 'm'};
+    ezb_zcl_binary_input_cluster_desc_add_attr(binary_desc, EZB_ZCL_ATTR_BINARY_INPUT_DESCRIPTION_ID, alarm_description);
+
+    /* --- Endpoint --- */
+    ezb_af_ep_config_t ep_config = {
+        .ep_id              = HA_ESP_SENSOR_ENDPOINT,
+        .app_profile_id     = EZB_AF_HA_PROFILE_ID,
+        .app_device_id      = 0x0302,  /* Temperature Sensor device ID (generic sensor) */
+        .app_device_version = 0,
+    };
+    ezb_af_ep_desc_t ep_desc = ezb_af_create_endpoint_desc(&ep_config);
+    ezb_af_endpoint_add_cluster_desc(ep_desc, basic_desc);
+    ezb_af_endpoint_add_cluster_desc(ep_desc, analog_desc);
+    ezb_af_endpoint_add_cluster_desc(ep_desc, binary_desc);
+
+    /* --- Device --- */
+    ezb_af_device_desc_t dev_desc = ezb_af_create_device_desc();
+    ezb_af_device_add_endpoint_desc(dev_desc, ep_desc);
+
+    return dev_desc;
 }
 
 /* Zigbee main task */
 static void esp_zb_task(void *pvParameters)
 {
-    /* Initialize Zigbee stack */
-    esp_zb_cfg_t zb_nwk_cfg = ESP_ZB_ZR_CONFIG();
-    esp_zb_init(&zb_nwk_cfg);
-    
-    /* Create endpoint list */
-    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
-    
-    /* Add custom sensor endpoint */
-    esp_zb_create_sensor_ep(ep_list);
-    
-    /* Register device */
-    esp_zb_device_register(ep_list);
-    
-    /* Register action handler */
-    esp_zb_core_action_handler_register(NULL);
-    
-    /* Set network channel */
-    esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
-    
+    /* Build full config including radio */
+    esp_zigbee_config_t zb_config = {
+        .device_config = {
+            .device_type         = EZB_NWK_DEVICE_TYPE_ROUTER,
+            .install_code_policy = INSTALLCODE_POLICY_ENABLE,
+            .zczr_config = {
+                .max_children = MAX_CHILDREN,
+            },
+        },
+        .platform_config = {
+            .radio_config = {
+                .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE,
+            },
+        },
+    };
+    ESP_ERROR_CHECK(esp_zigbee_init(&zb_config));
+
+    /* Register signal handler */
+    ezb_app_signal_add_handler(esp_zb_app_signal_handler);
+
+    /* Create and register device */
+    ezb_af_device_desc_t dev_desc = esp_zb_create_sensor_device();
+    ESP_ERROR_CHECK(ezb_af_device_desc_register(dev_desc));
+
+    /* Register ZCL action handler */
+    ezb_zcl_core_action_handler_register(NULL);
+
+    /* Set primary channel mask - all channels 11-26 */
+    ezb_bdb_set_primary_channel_set(0x07FFF800);
+
     ESP_LOGI(TAG, "Starting Zigbee router with MQ-7 sensor");
-    ESP_ERROR_CHECK(esp_zb_start(false));
-    
-    /* Main loop */
-    esp_zb_main_loop_iteration();
+    ESP_ERROR_CHECK(esp_zigbee_start(false));
+
+    /* Main loop - blocks until stack stops */
+    ESP_ERROR_CHECK(esp_zigbee_launch_mainloop());
 }
 
 void app_main(void)
 {
-    esp_zb_platform_config_t config = {
-        .radio_config = ESP_ZB_DEFAULT_RADIO_CONFIG(),
-        .host_config = ESP_ZB_DEFAULT_HOST_CONFIG(),
-    };
-    
     /* Initialize NVS */
     ESP_ERROR_CHECK(nvs_flash_init());
-    
-    /* Initialize platform */
-    ESP_ERROR_CHECK(esp_zb_platform_config(&config));
     
     /* Initialize peripherals */
     led_init();
